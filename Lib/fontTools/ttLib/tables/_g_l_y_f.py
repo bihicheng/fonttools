@@ -45,6 +45,8 @@ class table__g_l_y_f(DefaultTable.DefaultTable):
 		for i in range(0, len(loca)-1):
 			try:
 				glyphName = glyphOrder[i]
+				if glyphName == 'glyph07085':
+				    print(glyphName, 'decompiling...')
 			except IndexError:
 				noname = noname + 1
 				glyphName = 'ttxautoglyph%s' % i
@@ -296,6 +298,7 @@ UNSCALED_COMPONENT_OFFSET	= 0x1000  # composite designed not to have the compone
 class Glyph(object):
 
 	def __init__(self, data=""):
+		self.warnings = 0
 		if not data:
 			# empty char
 			self.numberOfContours = 0
@@ -530,6 +533,8 @@ class Glyph(object):
 					yFormat = yFormat + 'B'
 				elif not (flag & flagYsame):
 					yFormat = yFormat + 'h'
+				if j > len(flags) - 1:
+				    continue
 				flags[j] = flag
 				j = j + 1
 			if j >= nCoordinates:
@@ -541,6 +546,7 @@ class Glyph(object):
 		yDataLen = struct.calcsize(yFormat)
 		if len(data) - (xDataLen + yDataLen) >= 4:
 			warnings.warn("too much glyph data: %d excess bytes" % (len(data) - (xDataLen + yDataLen)))
+			self.warnings = 1
 		xCoordinates = struct.unpack(xFormat, data[:xDataLen])
 		yCoordinates = struct.unpack(yFormat, data[xDataLen:xDataLen+yDataLen])
 		return flags, xCoordinates, yCoordinates
