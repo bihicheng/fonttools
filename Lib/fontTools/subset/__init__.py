@@ -8,10 +8,12 @@ from fontTools import ttLib
 from fontTools.ttLib.tables import otTables
 from fontTools.misc import psCharStrings
 from fontTools.pens.boundsPen import BoundsPen
+from fontTools.misc.loggingTools import Timer
 import sys
 import struct
-import time
 import array
+import logging
+from types import MethodType
 
 __usage__ = "pyftsubset font-file [glyph...] [--option=value]..."
 
@@ -110,6 +112,11 @@ Output options:
       Specify flavor of output font file. May be 'woff' or 'woff2'.
       Note that WOFF2 requires the Brotli Python extension, available
       at https://github.com/google/brotli
+  --with-zopfli
+      Use the Google Zopfli algorithm to compress WOFF. The output is 3-8 %
+      smaller than pure zlib, but the compression speed is much slower.
+      The Zopfli Python bindings are available at:
+      https://github.com/anthrotype/py-zopfli
 
 Glyph set expansion:
   These options control how additional glyphs are added to the subset.
@@ -192,7 +199,7 @@ Font table options:
       By default, the following tables are dropped:
       'BASE', 'JSTF', 'DSIG', 'EBDT', 'EBLC', 'EBSC', 'SVG ', 'PCLT', 'LTSH'
       and Graphite tables: 'Feat', 'Glat', 'Gloc', 'Silf', 'Sill'
-      and color tables: 'CBLC', 'CBDT', 'sbix', 'COLR', 'CPAL'.
+      and color tables: 'CBLC', 'CBDT', 'sbix'.
       The tool will attempt to subset the remaining tables.
       Examples:
         --drop-tables-='SVG '
@@ -208,9 +215,9 @@ Font table options:
       By default, the following tables are included in this list, as
       they do not need subsetting (ignore the fact that 'loca' is listed
       here): 'gasp', 'head', 'hhea', 'maxp', 'vhea', 'OS/2', 'loca',
-      'name', 'cvt ', 'fpgm', 'prep', 'VMDX', and 'DSIG'. Tables that the tool
-      does not know how to subset and are not specified here will be dropped
-      from the font.
+      'name', 'cvt ', 'fpgm', 'prep', 'VMDX', 'DSIG' and 'CPAL'.
+      Tables that the tool does not know how to subset and are not specified
+      here will be dropped from the font.
       Example:
          --no-subset-tables+=FFTM
             * Keep 'FFTM' table in the font by preventing subsetting.
@@ -288,6 +295,14 @@ Other font-specific options:
       required by the standard, nor by any known implementation.
   --no-canonical-order
       Keep original order of font tables. This is faster. [default]
+  --prune-unicode-ranges
+      Update the 'OS/2 ulUnicodeRange*' bits after subsetting. The Unicode
+      ranges defined in the OpenType specification v1.7 are intersected with
+      the Unicode codepoints specified in the font's Unicode 'cmap' subtables:
+      when no overlap is found, the bit will be switched off. However, it will
+      *not* be switched on if an intersection is found.  [default]
+  --no-prune-unicode-ranges
+      Don't change the 'OS/2 ulUnicodeRange*' bits.
 
 Application options:
   --verbose
@@ -308,11 +323,30 @@ Example:
 """
 
 
+log = logging.getLogger(__name__)
+
+def _log_glyphs(self, glyphs, font=None):
+    self.info("Glyph names: %s", sorted(glyphs))
+    if font:
+        reverseGlyphMap = font.getReverseGlyphMap()
+        self.info("Glyph IDs:   %s", sorted(reverseGlyphMap[g] for g in glyphs))
+
+# bind "glyphs" function to 'log' object
+log.glyphs = MethodType(_log_glyphs, log)
+
+# I use a different timing channel so I can configure it separately from the
+# main module's logger
+timer = Timer(logger=logging.getLogger(__name__+".timer"))
+
+
 def _add_method(*clazzes):
     """Returns a decorator function that adds a new method to one or
     more classes."""
     def wrapper(method):
+        done = []
         for clazz in clazzes:
+            if clazz in done: continue # Support multiple names of a clazz
+            done.append(clazz)
             assert clazz.__name__ != 'DefaultTable', \
                     'Oops, table class not found.'
             assert not hasattr(clazz, method.__name__), \
@@ -731,14 +765,20 @@ def __subset_classify_context(self):
                 Type = 'Pos'
             if klass.__name__.startswith('Chain'):
                 Chain = 'Chain'
+                InputIdx = 1
+                DataLen = 3
             else:
                 Chain = ''
+                InputIdx = 0
+                DataLen = 1
             ChainTyp = Chain+Typ
 
             self.Typ = Typ
             self.Type = Type
             self.Chain = Chain
             self.ChainTyp = ChainTyp
+            self.InputIdx = InputIdx
+            self.DataLen = DataLen
 
             self.LookupRecord = Type+'LookupRecord'
 
@@ -747,10 +787,16 @@ def __subset_classify_context(self):
                 ChainCoverage = lambda r: r.Coverage
                 ContextData = lambda r:(None,)
                 ChainContextData = lambda r:(None, None, None)
+                SetContextData = None
+                SetChainContextData = None
                 RuleData = lambda r:(r.Input,)
                 ChainRuleData = lambda r:(r.Backtrack, r.Input, r.LookAhead)
-                SetRuleData = None
-                ChainSetRuleData = None
+                def SetRuleData(r, d):
+                    (r.Input,) = d
+                    (r.GlyphCount,) = (len(x)+1 for x in d)
+                def ChainSetRuleData(r, d):
+                    (r.Backtrack, r.Input, r.LookAhead) = d
+                    (r.BacktrackGlyphCount,r.InputGlyphCount,r.LookAheadGlyphCount,) = (len(d[0]),len(d[1])+1,len(d[2]))
             elif Format == 2:
                 Coverage = lambda r: r.Coverage
                 ChainCoverage = lambda r: r.Coverage
@@ -758,32 +804,50 @@ def __subset_classify_context(self):
                 ChainContextData = lambda r:(r.BacktrackClassDef,
                                              r.InputClassDef,
                                              r.LookAheadClassDef)
+                def SetContextData(r, d):
+                    (r.ClassDef,) = d
+                def SetChainContextData(r, d):
+                    (r.BacktrackClassDef,
+                     r.InputClassDef,
+                     r.LookAheadClassDef) = d
                 RuleData = lambda r:(r.Class,)
                 ChainRuleData = lambda r:(r.Backtrack, r.Input, r.LookAhead)
-                def SetRuleData(r, d):(r.Class,) = d
-                def ChainSetRuleData(r, d):(r.Backtrack, r.Input, r.LookAhead) = d
+                def SetRuleData(r, d):
+                    (r.Class,) = d
+                    (r.GlyphCount,) = (len(x)+1 for x in d)
+                def ChainSetRuleData(r, d):
+                    (r.Backtrack, r.Input, r.LookAhead) = d
+                    (r.BacktrackGlyphCount,r.InputGlyphCount,r.LookAheadGlyphCount,) = (len(d[0]),len(d[1])+1,len(d[2]))
             elif Format == 3:
                 Coverage = lambda r: r.Coverage[0]
                 ChainCoverage = lambda r: r.InputCoverage[0]
                 ContextData = None
                 ChainContextData = None
+                SetContextData = None
+                SetChainContextData = None
                 RuleData = lambda r: r.Coverage
                 ChainRuleData = lambda r:(r.BacktrackCoverage +
                                           r.InputCoverage +
                                           r.LookAheadCoverage)
-                SetRuleData = None
-                ChainSetRuleData = None
+                def SetRuleData(r, d):
+                    (r.Coverage,) = d
+                    (r.GlyphCount,) = (len(x) for x in d)
+                def ChainSetRuleData(r, d):
+                    (r.BacktrackCoverage, r.InputCoverage, r.LookAheadCoverage) = d
+                    (r.BacktrackGlyphCount,r.InputGlyphCount,r.LookAheadGlyphCount,) = (len(x) for x in d)
             else:
                 assert 0, "unknown format: %s" % Format
 
             if Chain:
                 self.Coverage = ChainCoverage
                 self.ContextData = ChainContextData
+                self.SetContextData = SetChainContextData
                 self.RuleData = ChainRuleData
                 self.SetRuleData = ChainSetRuleData
             else:
                 self.Coverage = Coverage
                 self.ContextData = ContextData
+                self.SetContextData = SetContextData
                 self.RuleData = RuleData
                 self.SetRuleData = SetRuleData
 
@@ -1243,9 +1307,9 @@ def collect_features(self):
     return _uniq_sort(sum(feature_indices, []))
 
 @_add_method(otTables.ScriptList)
-def subset_features(self, feature_indices):
+def subset_features(self, feature_indices, retain_empty):
     self.ScriptRecord = [s for s in self.ScriptRecord
-                         if s.Script.subset_features(feature_indices)]
+                         if s.Script.subset_features(feature_indices) or retain_empty]
     self.ScriptCount = len(self.ScriptRecord)
     return bool(self.ScriptCount)
 
@@ -1253,6 +1317,24 @@ def subset_features(self, feature_indices):
 def collect_features(self):
     return _uniq_sort(sum((s.Script.collect_features()
                            for s in self.ScriptRecord), []))
+
+# CBLC will inherit it
+@_add_method(ttLib.getTableClass('EBLC'))
+def subset_glyphs(self, s):
+  for strike in self.strikes:
+    for indexSubTable in strike.indexSubTables:
+      indexSubTable.names = [n for n in indexSubTable.names if n in s.glyphs]
+    strike.indexSubTables = [i for i in strike.indexSubTables if i.names]
+  self.strikes = [s for s in self.strikes if s.indexSubTables]
+
+  return True
+
+# CBDC will inherit it
+@_add_method(ttLib.getTableClass('EBDT'))
+def subset_glyphs(self, s):
+  self.strikeData = [{g: strike[g] for g in s.glyphs if g in strike}
+                     for strike in self.strikeData]
+  return True
 
 @_add_method(ttLib.getTableClass('GSUB'))
 def closure_glyphs(self, s):
@@ -1292,6 +1374,13 @@ def subset_glyphs(self, s):
 
 @_add_method(ttLib.getTableClass('GSUB'),
              ttLib.getTableClass('GPOS'))
+def retain_empty_scripts(self):
+    # https://github.com/behdad/fonttools/issues/518
+    # https://bugzilla.mozilla.org/show_bug.cgi?id=1080739#c15
+    return self.__class__ == ttLib.getTableClass('GSUB')
+
+@_add_method(ttLib.getTableClass('GSUB'),
+             ttLib.getTableClass('GPOS'))
 def subset_lookups(self, lookup_indices):
     """Retains specified lookups, then removes empty features, language
     systems, and scripts."""
@@ -1302,7 +1391,7 @@ def subset_lookups(self, lookup_indices):
     else:
         feature_indices = []
     if self.table.ScriptList:
-        self.table.ScriptList.subset_features(feature_indices)
+        self.table.ScriptList.subset_features(feature_indices, self.retain_empty_scripts())
 
 @_add_method(ttLib.getTableClass('GSUB'),
              ttLib.getTableClass('GPOS'))
@@ -1343,7 +1432,7 @@ def subset_feature_tags(self, feature_tags):
     else:
         feature_indices = []
     if self.table.ScriptList:
-        self.table.ScriptList.subset_features(feature_indices)
+        self.table.ScriptList.subset_features(feature_indices, self.retain_empty_scripts())
 
 @_add_method(ttLib.getTableClass('GSUB'),
              ttLib.getTableClass('GPOS'))
@@ -1356,7 +1445,7 @@ def prune_features(self):
     if self.table.FeatureList:
         self.table.FeatureList.subset_features(feature_indices)
     if self.table.ScriptList:
-        self.table.ScriptList.subset_features(feature_indices)
+        self.table.ScriptList.subset_features(feature_indices, self.retain_empty_scripts())
 
 @_add_method(ttLib.getTableClass('GSUB'),
              ttLib.getTableClass('GPOS'))
@@ -1540,6 +1629,114 @@ def prune_pre_subset(self, options):
 def subset_glyphs(self, s):
     self.extraNames = []    # This seems to do it
     return True # Required table
+
+@_add_method(ttLib.getTableClass('COLR'))
+def closure_glyphs(self, s):
+    decompose = s.glyphs
+    while True:
+        layers = set()
+        for g in decompose:
+            if g not in self.ColorLayers:
+                continue
+            for l in self.ColorLayers[g]:
+                if l.name not in s.glyphs:
+                    layers.add(l.name)
+        layers = set(l for l in layers if l not in s.glyphs)
+        if not layers:
+            break
+        decompose = layers
+        s.glyphs.update(layers)
+
+@_add_method(ttLib.getTableClass('COLR'))
+def subset_glyphs(self, s):
+    self.ColorLayers = {g: self.ColorLayers[g] for g in s.glyphs if g in self.ColorLayers}
+    return bool(self.ColorLayers)
+
+# TODO: prune unused palettes
+@_add_method(ttLib.getTableClass('CPAL'))
+def prune_post_subset(self, options):
+    return True
+
+@_add_method(otTables.MathGlyphConstruction)
+def closure_glyphs(self, glyphs):
+    variants = set()
+    for v in self.MathGlyphVariantRecord:
+        variants.add(v.VariantGlyph)
+    if self.GlyphAssembly:
+        for p in self.GlyphAssembly.PartRecords:
+            variants.add(p.glyph)
+    return variants
+
+@_add_method(otTables.MathVariants)
+def closure_glyphs(self, s):
+    glyphs = frozenset(s.glyphs)
+    variants = set()
+
+    indices = self.VertGlyphCoverage.intersect(glyphs)
+    for i in indices:
+        variants.update(self.VertGlyphConstruction[i].closure_glyphs(glyphs))
+
+    indices = self.HorizGlyphCoverage.intersect(glyphs)
+    for i in indices:
+        variants.update(self.HorizGlyphConstruction[i].closure_glyphs(glyphs))
+
+    s.glyphs.update(variants)
+
+@_add_method(ttLib.getTableClass('MATH'))
+def closure_glyphs(self, s):
+    self.table.MathVariants.closure_glyphs(s)
+
+@_add_method(otTables.MathItalicsCorrectionInfo)
+def subset_glyphs(self, s):
+    indices = self.Coverage.subset(s.glyphs)
+    self.ItalicsCorrection = [self.ItalicsCorrection[i] for i in indices]
+    self.ItalicsCorrectionCount = len(self.ItalicsCorrection)
+    return bool(self.ItalicsCorrectionCount)
+
+@_add_method(otTables.MathTopAccentAttachment)
+def subset_glyphs(self, s):
+    indices = self.TopAccentCoverage.subset(s.glyphs)
+    self.TopAccentAttachment = [self.TopAccentAttachment[i] for i in indices]
+    self.TopAccentAttachmentCount = len(self.TopAccentAttachment)
+    return bool(self.TopAccentAttachmentCount)
+
+@_add_method(otTables.MathKernInfo)
+def subset_glyphs(self, s):
+    indices = self.MathKernCoverage.subset(s.glyphs)
+    self.MathKernInfoRecords = [self.MathKernInfoRecords[i] for i in indices]
+    self.MathKernCount = len(self.MathKernInfoRecords)
+    return bool(self.MathKernCount)
+
+@_add_method(otTables.MathGlyphInfo)
+def subset_glyphs(self, s):
+    if self.MathItalicsCorrectionInfo:
+        self.MathItalicsCorrectionInfo.subset_glyphs(s)
+    if self.MathTopAccentAttachment:
+        self.MathTopAccentAttachment.subset_glyphs(s)
+    if self.MathKernInfo:
+        self.MathKernInfo.subset_glyphs(s)
+    if self.ExtendedShapeCoverage:
+        self.ExtendedShapeCoverage.subset(s.glyphs)
+    return True
+
+@_add_method(otTables.MathVariants)
+def subset_glyphs(self, s):
+    indices = self.VertGlyphCoverage.subset(s.glyphs)
+    self.VertGlyphConstruction = [self.VertGlyphConstruction[i] for i in indices]
+    self.VertGlyphCount = len(self.VertGlyphConstruction)
+
+    indices = self.HorizGlyphCoverage.subset(s.glyphs)
+    self.HorizGlyphConstruction = [self.HorizGlyphConstruction[i] for i in indices]
+    self.HorizGlyphCount = len(self.HorizGlyphConstruction)
+
+    return True
+
+@_add_method(ttLib.getTableClass('MATH'))
+def subset_glyphs(self, s):
+    s.glyphs = s.glyphs_mathed
+    self.table.MathGlyphInfo.subset_glyphs(s)
+    self.table.MathVariants.subset_glyphs(s)
+    return True
 
 @_add_method(ttLib.getTableModule('glyf').Glyph)
 def remapComponentsFast(self, indices):
@@ -2167,7 +2364,7 @@ def prune_pre_subset(self, options):
     return True    # Required table
 
 
-# TODO(behdad) OS/2 ulUnicodeRange / ulCodePageRange?
+# TODO(behdad) OS/2 ulCodePageRange?
 # TODO(behdad) Drop AAT tables.
 # TODO(behdad) Drop unneeded GSUB/GPOS Script/LangSys entries.
 # TODO(behdad) Drop empty GSUB/GPOS, and GDEF if no GSUB/GPOS left
@@ -2189,10 +2386,10 @@ class Options(object):
     _drop_tables_default = ['BASE', 'JSTF', 'DSIG', 'EBDT', 'EBLC',
                             'EBSC', 'SVG', 'PCLT', 'LTSH']
     _drop_tables_default += ['Feat', 'Glat', 'Gloc', 'Silf', 'Sill']  # Graphite
-    _drop_tables_default += ['CBLC', 'CBDT', 'sbix', 'COLR', 'CPAL']  # Color
+    _drop_tables_default += ['sbix']  # Color
     _no_subset_tables_default = ['gasp', 'head', 'hhea', 'maxp',
                                  'vhea', 'OS/2', 'loca', 'name', 'cvt',
-                                 'fpgm', 'prep', 'VDMX', 'DSIG']
+                                 'fpgm', 'prep', 'VDMX', 'DSIG', 'CPAL']
     _hinting_tables_default = ['cvt', 'fpgm', 'prep', 'hdmx', 'VDMX']
 
     # Based on HarfBuzz shapers
@@ -2215,31 +2412,37 @@ class Options(object):
     _layout_features_default = _uniq_sort(sum(
             iter(_layout_features_groups.values()), []))
 
-    drop_tables = _drop_tables_default
-    no_subset_tables = _no_subset_tables_default
-    hinting_tables = _hinting_tables_default
-    legacy_kern = False    # drop 'kern' table if GPOS available
-    layout_features = _layout_features_default
-    ignore_missing_glyphs = False
-    ignore_missing_unicodes = True
-    hinting = True
-    glyph_names = False
-    legacy_cmap = False
-    symbol_cmap = False
-    name_IDs = [1, 2]    # Family and Style
-    name_legacy = False
-    name_languages = [0x0409]    # English
-    obfuscate_names = False    # to make webfont unusable as a system font
-    notdef_glyph = True # gid0 for TrueType / .notdef for CFF
-    notdef_outline = False # No need for notdef to have an outline really
-    recommended_glyphs = False    # gid1, gid2, gid3 for TrueType
-    recalc_bounds = False # Recalculate font bounding boxes
-    recalc_timestamp = False # Recalculate font modified timestamp
-    canonical_order = False # Order tables as recommended
-    flavor = None  # May be 'woff' or 'woff2'
-    desubroutinize = False # Desubroutinize CFF CharStrings
-
     def __init__(self, **kwargs):
+
+        self.drop_tables = self._drop_tables_default[:]
+        self.no_subset_tables = self._no_subset_tables_default[:]
+        self.hinting_tables = self._hinting_tables_default[:]
+        self.legacy_kern = False    # drop 'kern' table if GPOS available
+        self.layout_features = self._layout_features_default[:]
+        self.ignore_missing_glyphs = False
+        self.ignore_missing_unicodes = True
+        self.hinting = True
+        self.glyph_names = False
+        self.legacy_cmap = False
+        self.symbol_cmap = False
+        self.name_IDs = [1, 2]    # Family and Style
+        self.name_legacy = False
+        self.name_languages = [0x0409]    # English
+        self.obfuscate_names = False    # to make webfont unusable as a system font
+        self.notdef_glyph = True # gid0 for TrueType / .notdef for CFF
+        self.notdef_outline = False # No need for notdef to have an outline really
+        self.recommended_glyphs = False    # gid1, gid2, gid3 for TrueType
+        self.recalc_bounds = False # Recalculate font bounding boxes
+        self.recalc_timestamp = False # Recalculate font modified timestamp
+        self.prune_unicode_ranges = True  # Clear unused 'ulUnicodeRange' bits
+        self.canonical_order = None # Order tables as recommended
+        self.flavor = None  # May be 'woff' or 'woff2'
+        self.with_zopfli = False  # use zopfli instead of zlib for WOFF 1.0
+        self.desubroutinize = False # Desubroutinize CFF CharStrings
+        self.verbose = False
+        self.timing = False
+        self.xml = False
+
         self.set(**kwargs)
 
     def set(self, **kwargs):
@@ -2261,7 +2464,12 @@ class Options(object):
             if i == -1:
                 if a.startswith("no-"):
                     k = a[3:]
-                    v = False
+                    if k == "canonical-order":
+                        # reorderTables=None is faster than False (the latter
+                        # still reorders to "keep" the original table order)
+                        v = None
+                    else:
+                        v = False
                 else:
                     k = a
                     v = True
@@ -2324,15 +2532,12 @@ class Subsetter(object):
     class MissingGlyphsSubsettingError(SubsettingError): pass
     class MissingUnicodesSubsettingError(SubsettingError): pass
 
-    def __init__(self, options=None, log=None):
+    def __init__(self, options=None):
 
-        if not log:
-            log = Logger()
         if not options:
             options = Options()
 
         self.options = options
-        self.log = log
         self.unicodes_requested = set()
         self.glyph_names_requested = set()
         self.glyph_ids_requested = set()
@@ -2354,23 +2559,23 @@ class Subsetter(object):
             if(tag.strip() in self.options.drop_tables or
                  (tag.strip() in self.options.hinting_tables and not self.options.hinting) or
                  (tag == 'kern' and (not self.options.legacy_kern and 'GPOS' in font))):
-                self.log(tag, "dropped")
+                log.info("%s dropped", tag)
                 del font[tag]
                 continue
 
             clazz = ttLib.getTableClass(tag)
 
             if hasattr(clazz, 'prune_pre_subset'):
-                table = font[tag]
-                self.log.lapse("load '%s'" % tag)
-                retain = table.prune_pre_subset(self.options)
-                self.log.lapse("prune '%s'" % tag)
+                with timer("load '%s'" % tag):
+                    table = font[tag]
+                with timer("prune '%s'" % tag):
+                    retain = table.prune_pre_subset(self.options)
                 if not retain:
-                    self.log(tag, "pruned to empty; dropped")
+                    log.info("%s pruned to empty; dropped", tag)
                     del font[tag]
                     continue
                 else:
-                    self.log(tag, "pruned")
+                    log.info("%s pruned", tag)
 
     def _closure_glyphs(self, font):
 
@@ -2388,7 +2593,7 @@ class Subsetter(object):
         self.glyphs_missing.update(i for i in self.glyph_ids_requested
                                    if i >= len(glyph_order))
         if self.glyphs_missing:
-            self.log("Missing requested glyphs: %s" % self.glyphs_missing)
+            log.info("Missing requested glyphs: %s", self.glyphs_missing)
             if not self.options.ignore_missing_glyphs:
                 raise self.MissingGlyphsSubsettingError(self.glyphs_missing)
 
@@ -2396,13 +2601,13 @@ class Subsetter(object):
 
         self.unicodes_missing = set()
         if 'cmap' in font:
-            font['cmap'].closure_glyphs(self)
-            self.glyphs.intersection_update(realGlyphs)
-            self.log.lapse("close glyph list over 'cmap'")
+            with timer("close glyph list over 'cmap'"):
+                font['cmap'].closure_glyphs(self)
+                self.glyphs.intersection_update(realGlyphs)
         self.glyphs_cmaped = frozenset(self.glyphs)
         if self.unicodes_missing:
             missing = ["U+%04X" % u for u in self.unicodes_missing]
-            self.log("Missing glyphs for requested Unicodes: %s" % missing)
+            log.info("Missing glyphs for requested Unicodes: %s", missing)
             if not self.options.ignore_missing_unicodes:
                 raise self.MissingUnicodesSubsettingError(missing)
             del missing
@@ -2410,43 +2615,67 @@ class Subsetter(object):
         if self.options.notdef_glyph:
             if 'glyf' in font:
                 self.glyphs.add(font.getGlyphName(0))
-                self.log("Added gid0 to subset")
+                log.info("Added gid0 to subset")
             else:
                 self.glyphs.add('.notdef')
-                self.log("Added .notdef to subset")
+                log.info("Added .notdef to subset")
         if self.options.recommended_glyphs:
             if 'glyf' in font:
                 for i in range(min(4, len(font.getGlyphOrder()))):
                     self.glyphs.add(font.getGlyphName(i))
-                self.log("Added first four glyphs to subset")
+                log.info("Added first four glyphs to subset")
 
         if 'GSUB' in font:
-            self.log("Closing glyph list over 'GSUB': %d glyphs before" %
-                     len(self.glyphs))
-            self.log.glyphs(self.glyphs, font=font)
-            font['GSUB'].closure_glyphs(self)
-            self.glyphs.intersection_update(realGlyphs)
-            self.log("Closed glyph list over 'GSUB': %d glyphs after" %
-                     len(self.glyphs))
-            self.log.glyphs(self.glyphs, font=font)
-            self.log.lapse("close glyph list over 'GSUB'")
+            with timer("close glyph list over 'GSUB'"):
+                log.info("Closing glyph list over 'GSUB': %d glyphs before",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
+                font['GSUB'].closure_glyphs(self)
+                self.glyphs.intersection_update(realGlyphs)
+                log.info("Closed glyph list over 'GSUB': %d glyphs after",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
         self.glyphs_gsubed = frozenset(self.glyphs)
 
+        if 'MATH' in font:
+            with timer("close glyph list over 'MATH'"):
+                log.info("Closing glyph list over 'MATH': %d glyphs before",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
+                font['MATH'].closure_glyphs(self)
+                self.glyphs.intersection_update(realGlyphs)
+                log.info("Closed glyph list over 'MATH': %d glyphs after",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
+        self.glyphs_mathed = frozenset(self.glyphs)
+
+        if 'COLR' in font:
+            with timer("close glyph list over 'COLR'"):
+                log.info("Closing glyph list over 'COLR': %d glyphs before",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
+                font['COLR'].closure_glyphs(self)
+                self.glyphs.intersection_update(realGlyphs)
+                log.info("Closed glyph list over 'COLR': %d glyphs after",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
+        self.glyphs_colred = frozenset(self.glyphs)
+
         if 'glyf' in font:
-            self.log("Closing glyph list over 'glyf': %d glyphs before" %
-                     len(self.glyphs))
-            self.log.glyphs(self.glyphs, font=font)
-            font['glyf'].closure_glyphs(self)
-            self.glyphs.intersection_update(realGlyphs)
-            self.log("Closed glyph list over 'glyf': %d glyphs after" %
-                     len(self.glyphs))
-            self.log.glyphs(self.glyphs, font=font)
-            self.log.lapse("close glyph list over 'glyf'")
+            with timer("close glyph list over 'glyf'"):
+                log.info("Closing glyph list over 'glyf': %d glyphs before",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
+                font['glyf'].closure_glyphs(self)
+                self.glyphs.intersection_update(realGlyphs)
+                log.info("Closed glyph list over 'glyf': %d glyphs after",
+                         len(self.glyphs))
+                log.glyphs(self.glyphs, font=font)
         self.glyphs_glyfed = frozenset(self.glyphs)
 
         self.glyphs_all = frozenset(self.glyphs)
 
-        self.log("Retaining %d glyphs: " % len(self.glyphs_all))
+        log.info("Retaining %d glyphs", len(self.glyphs_all))
 
         del self.glyphs
 
@@ -2456,41 +2685,46 @@ class Subsetter(object):
             clazz = ttLib.getTableClass(tag)
 
             if tag.strip() in self.options.no_subset_tables:
-                self.log(tag, "subsetting not needed")
+                log.info("%s subsetting not needed", tag)
             elif hasattr(clazz, 'subset_glyphs'):
-                table = font[tag]
-                self.glyphs = self.glyphs_all
-                retain = table.subset_glyphs(self)
-                del self.glyphs
-                self.log.lapse("subset '%s'" % tag)
+                with timer("subset '%s'" % tag):
+                    table = font[tag]
+                    self.glyphs = self.glyphs_all
+                    retain = table.subset_glyphs(self)
+                    del self.glyphs
                 if not retain:
-                    self.log(tag, "subsetted to empty; dropped")
+                    log.info("%s subsetted to empty; dropped", tag)
                     del font[tag]
                 else:
-                    self.log(tag, "subsetted")
+                    log.info("%s subsetted", tag)
             else:
-                self.log(tag, "NOT subset; don't know how to subset; dropped")
+                log.info("%s NOT subset; don't know how to subset; dropped", tag)
                 del font[tag]
 
-        glyphOrder = font.getGlyphOrder()
-        glyphOrder = [g for g in glyphOrder if g in self.glyphs_all]
-        font.setGlyphOrder(glyphOrder)
-        font._buildReverseGlyphOrderDict()
-        self.log.lapse("subset GlyphOrder")
+        with timer("subset GlyphOrder"):
+            glyphOrder = font.getGlyphOrder()
+            glyphOrder = [g for g in glyphOrder if g in self.glyphs_all]
+            font.setGlyphOrder(glyphOrder)
+            font._buildReverseGlyphOrderDict()
 
     def _prune_post_subset(self, font):
         for tag in font.keys():
             if tag == 'GlyphOrder': continue
+            if tag == 'OS/2' and self.options.prune_unicode_ranges:
+                old_uniranges = font[tag].getUnicodeRanges()
+                new_uniranges = font[tag].recalcUnicodeRanges(font, pruneOnly=True)
+                if old_uniranges != new_uniranges:
+                    log.info("%s Unicode ranges pruned: %s", tag, sorted(new_uniranges))
             clazz = ttLib.getTableClass(tag)
             if hasattr(clazz, 'prune_post_subset'):
-                table = font[tag]
-                retain = table.prune_post_subset(self.options)
-                self.log.lapse("prune '%s'" % tag)
+                with timer("prune '%s'" % tag):
+                    table = font[tag]
+                    retain = table.prune_post_subset(self.options)
                 if not retain:
-                    self.log(tag, "pruned to empty; dropped")
+                    log.info("%s pruned to empty; dropped", tag)
                     del font[tag]
                 else:
-                    self.log(tag, "pruned")
+                    log.info("%s pruned", tag)
 
     def subset(self, font):
 
@@ -2500,56 +2734,7 @@ class Subsetter(object):
         self._prune_post_subset(font)
 
 
-class Logger(object):
-
-    def __init__(self, verbose=False, xml=False, timing=False):
-        self.verbose = verbose
-        self.xml = xml
-        self.timing = timing
-        self.last_time = self.start_time = time.time()
-
-    def parse_opts(self, argv):
-        argv = argv[:]
-        for v in ['verbose', 'xml', 'timing']:
-            if "--"+v in argv:
-                setattr(self, v, True)
-                argv.remove("--"+v)
-        return argv
-
-    def __call__(self, *things):
-        if not self.verbose:
-            return
-        print(' '.join(str(x) for x in things))
-
-    def lapse(self, *things):
-        if not self.timing:
-            return
-        new_time = time.time()
-        print("Took %0.3fs to %s" %(new_time - self.last_time,
-                                    ' '.join(str(x) for x in things)))
-        self.last_time = new_time
-
-    def glyphs(self, glyphs, font=None):
-        if not self.verbose:
-            return
-        self("Glyph names:", sorted(glyphs))
-        if font:
-            reverseGlyphMap = font.getReverseGlyphMap()
-            self("Glyph IDs:    ", sorted(reverseGlyphMap[g] for g in glyphs))
-
-    def font(self, font, file=sys.stdout):
-        if not self.xml:
-            return
-        from fontTools.misc import xmlWriter
-        writer = xmlWriter.XMLWriter(file)
-        for tag in font.keys():
-            writer.begintag(tag)
-            writer.newline()
-            font[tag].toXML(writer, font)
-            writer.endtag(tag)
-            writer.newline()
-
-
+@timer("load font")
 def load_font(fontFile,
               options,
               allowVID=False,
@@ -2584,9 +2769,13 @@ def load_font(fontFile,
 
     return font
 
+@timer("compile and save font")
 def save_font(font, outfile, options):
     if options.flavor and not hasattr(font, 'flavor'):
         raise Exception("fonttools version does not support flavors.")
+    if options.with_zopfli and options.flavor == "woff":
+        from fontTools.ttLib import sfnt
+        sfnt.USE_ZOPFLI = True
     font.flavor = options.flavor
     font.save(outfile, reorderTables=options.canonical_order)
 
@@ -2617,7 +2806,13 @@ def parse_gids(s):
 def parse_glyphs(s):
     return s.replace(',', ' ').split()
 
+def usage():
+    print("usage:", __usage__, file=sys.stderr)
+    print("Try pyftsubset --help for more information.\n", file=sys.stderr)
+
+@timer("make one with everything (TOTAL TIME)")
 def main(args=None):
+    from fontTools import configLogger
 
     if args is None:
         args = sys.argv[1:]
@@ -2626,26 +2821,33 @@ def main(args=None):
         print(__doc__)
         sys.exit(0)
 
-    log = Logger()
-    args = log.parse_opts(args)
-
     options = Options()
-    args = options.parse_opts(args,
-        ignore_unknown=['gids', 'gids-file',
-                        'glyphs', 'glyphs-file',
-                        'text', 'text-file',
-                        'unicodes', 'unicodes-file',
-                        'output-file'])
+    try:
+        args = options.parse_opts(args,
+            ignore_unknown=['gids', 'gids-file',
+                            'glyphs', 'glyphs-file',
+                            'text', 'text-file',
+                            'unicodes', 'unicodes-file',
+                            'output-file'])
+    except options.OptionError as e:
+        usage()
+        print("ERROR:", e, file=sys.stderr)
+        sys.exit(2)
 
     if len(args) < 2:
-        print("usage:", __usage__, file=sys.stderr)
-        print("Try pyftsubset --help for more information.", file=sys.stderr)
+        usage()
         sys.exit(1)
+
+    configLogger(level=logging.INFO if options.verbose else logging.WARNING)
+    if options.timing:
+        timer.logger.setLevel(logging.DEBUG)
+    else:
+        timer.logger.disabled = True
 
     fontfile = args[0]
     args = args[1:]
 
-    subsetter = Subsetter(options=options, log=log)
+    subsetter = Subsetter(options=options)
     outfile = fontfile + '.subset'
     glyphs = []
     gids = []
@@ -2697,36 +2899,33 @@ def main(args=None):
 
     dontLoadGlyphNames = not options.glyph_names and not glyphs
     font = load_font(fontfile, options, dontLoadGlyphNames=dontLoadGlyphNames)
-    log.lapse("load font")
-    if wildcard_glyphs:
+
+    with timer("compile glyph list"):
+        if wildcard_glyphs:
             glyphs.extend(font.getGlyphOrder())
-    if wildcard_unicodes:
+        if wildcard_unicodes:
             for t in font['cmap'].tables:
                 if t.isUnicode():
                     unicodes.extend(t.cmap.keys())
-    assert '' not in glyphs
+        assert '' not in glyphs
 
-    log.lapse("compile glyph list")
-    log("Text: '%s'" % text)
-    log("Unicodes:", unicodes)
-    log("Glyphs:", glyphs)
-    log("Gids:", gids)
+    log.info("Text: '%s'" % text)
+    log.info("Unicodes: %s", unicodes)
+    log.info("Glyphs: %s", glyphs)
+    log.info("Gids: %s", gids)
 
     subsetter.populate(glyphs=glyphs, gids=gids, unicodes=unicodes, text=text)
     subsetter.subset(font)
 
-    save_font (font, outfile, options)
-    log.lapse("compile and save font")
+    save_font(font, outfile, options)
 
-    log.last_time = log.start_time
-    log.lapse("make one with everything(TOTAL TIME)")
-
-    if log.verbose:
+    if options.verbose:
         import os
-        log("Input font:% 7d bytes: %s" % (os.path.getsize(fontfile), fontfile))
-        log("Subset font:% 7d bytes: %s" % (os.path.getsize(outfile), outfile))
+        log.info("Input font:% 7d bytes: %s" % (os.path.getsize(fontfile), fontfile))
+        log.info("Subset font:% 7d bytes: %s" % (os.path.getsize(outfile), outfile))
 
-    log.font(font)
+    if options.xml:
+        font.saveXML(sys.stdout)
 
     font.close()
 
@@ -2734,7 +2933,6 @@ def main(args=None):
 __all__ = [
     'Options',
     'Subsetter',
-    'Logger',
     'load_font',
     'save_font',
     'parse_gids',

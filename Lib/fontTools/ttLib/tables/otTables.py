@@ -8,7 +8,10 @@ from __future__ import print_function, division, absolute_import
 from fontTools.misc.py23 import *
 from .otBase import BaseTable, FormatSwitchingBaseTable
 import operator
-import warnings
+import logging
+
+
+log = logging.getLogger(__name__)
 
 
 class FeatureParams(BaseTable):
@@ -46,7 +49,7 @@ class Coverage(FormatSwitchingBaseTable):
 			# this when writing font out.
 			sorted_ranges = sorted(ranges, key=lambda a: a.StartCoverageIndex)
 			if ranges != sorted_ranges:
-				warnings.warn("GSUB/GPOS Coverage is not sorted by glyph ids.")
+				log.warning("GSUB/GPOS Coverage is not sorted by glyph ids.")
 				ranges = sorted_ranges
 			del sorted_ranges
 			for r in ranges:
@@ -57,14 +60,14 @@ class Coverage(FormatSwitchingBaseTable):
 				try:
 					startID = font.getGlyphID(start, requireReal=True)
 				except KeyError:
-					warnings.warn("Coverage table has start glyph ID out of range: %s." % start)
+					log.warning("Coverage table has start glyph ID out of range: %s.", start)
 					continue
 				try:
 					endID = font.getGlyphID(end, requireReal=True) + 1
 				except KeyError:
 					# Apparently some tools use 65535 to "match all" the range
 					if end != 'glyph65535':
-						warnings.warn("Coverage table has end glyph ID out of range: %s." % end)
+						log.warning("Coverage table has end glyph ID out of range: %s.", end)
 					# NOTE: We clobber out-of-range things here.  There are legit uses for those,
 					# but none that we have seen in the wild.
 					endID = len(glyphOrder)
@@ -107,7 +110,7 @@ class Coverage(FormatSwitchingBaseTable):
 					ranges[i] = r
 					index = index + end - start + 1
 				if brokenOrder:
-					warnings.warn("GSUB/GPOS Coverage is not sorted by glyph ids.")
+					log.warning("GSUB/GPOS Coverage is not sorted by glyph ids.")
 					ranges.sort(key=lambda a: a.StartID)
 				for r in ranges:
 					del r.StartID
@@ -288,11 +291,12 @@ class ClassDef(FormatSwitchingBaseTable):
 			try:
 				startID = font.getGlyphID(start, requireReal=True)
 			except KeyError:
-				warnings.warn("ClassDef table has start glyph ID out of range: %s." % start)
+				log.warning("ClassDef table has start glyph ID out of range: %s.", start)
 				startID = len(glyphOrder)
 			endID = startID + len(classList)
 			if endID > len(glyphOrder):
-				warnings.warn("ClassDef table has entries for out of range glyph IDs: %s,%s." % (start, len(classList)))
+				log.warning("ClassDef table has entries for out of range glyph IDs: %s,%s.",
+					start, len(classList))
 				# NOTE: We clobber out-of-range things here.  There are legit uses for those,
 				# but none that we have seen in the wild.
 				endID = len(glyphOrder)
@@ -309,14 +313,14 @@ class ClassDef(FormatSwitchingBaseTable):
 				try:
 					startID = font.getGlyphID(start, requireReal=True)
 				except KeyError:
-					warnings.warn("ClassDef table has start glyph ID out of range: %s." % start)
+					log.warning("ClassDef table has start glyph ID out of range: %s.", start)
 					continue
 				try:
 					endID = font.getGlyphID(end, requireReal=True) + 1
 				except KeyError:
 					# Apparently some tools use 65535 to "match all" the range
 					if end != 'glyph65535':
-						warnings.warn("ClassDef table has end glyph ID out of range: %s." % end)
+						log.warning("ClassDef table has end glyph ID out of range: %s.", end)
 					# NOTE: We clobber out-of-range things here.  There are legit uses for those,
 					# but none that we have seen in the wild.
 					endID = len(glyphOrder)
@@ -478,6 +482,21 @@ class LigatureSubst(FormatSwitchingBaseTable):
 		ligatures = getattr(self, "ligatures", None)
 		if ligatures is None:
 			ligatures = self.ligatures = {}
+
+		if ligatures and isinstance(next(iter(ligatures)), tuple):
+			# New high-level API in v3.1 and later.  Note that we just support compiling this
+			# for now.  We don't load to this API, and don't do XML with it.
+
+			# ligatures is map from components-sequence to lig-glyph
+			newLigatures = dict()
+			for comps,lig in sorted(ligatures.items(), key=lambda item: (-len(item[0]), item[0])):
+				ligature = Ligature()
+				ligature.Component = comps[1:]
+				ligature.CompCount = len(comps)
+				ligature.LigGlyph = lig
+				newLigatures.setdefault(comps[0], []).append(ligature)
+			ligatures = newLigatures
+
 		items = list(ligatures.items())
 		for i in range(len(items)):
 			glyphName, set = items[i]
@@ -681,6 +700,42 @@ def splitLigatureSubst(oldSubTable, newSubTable, overflowRecord):
 	return ok
 
 
+def splitPairPos(oldSubTable, newSubTable, overflowRecord):
+	st = oldSubTable
+	ok = False
+	newSubTable.Format = oldSubTable.Format
+	if oldSubTable.Format == 2 and oldSubTable.Class1Count > 1:
+		for name in 'Class2Count', 'ClassDef2', 'ValueFormat1', 'ValueFormat2':
+			setattr(newSubTable, name, getattr(oldSubTable, name))
+
+		# Move top half of class numbers to new subtable
+
+		newSubTable.Coverage = oldSubTable.Coverage.__class__()
+		newSubTable.ClassDef1 = oldSubTable.ClassDef1.__class__()
+
+		coverage = oldSubTable.Coverage.glyphs
+		classDefs = oldSubTable.ClassDef1.classDefs
+		records = oldSubTable.Class1Record
+
+		oldCount = oldSubTable.Class1Count // 2
+		newGlyphs = set(k for k,v in classDefs.items() if v >= oldCount)
+
+		oldSubTable.Coverage.glyphs = [g for g in coverage if g not in newGlyphs]
+		oldSubTable.ClassDef1.classDefs = {k:v for k,v in classDefs.items() if v < oldCount}
+		oldSubTable.Class1Record = records[:oldCount]
+
+		newSubTable.Coverage.glyphs = [g for g in coverage if g in newGlyphs]
+		newSubTable.ClassDef1.classDefs = {k:(v-oldCount) for k,v in classDefs.items() if v >= oldCount}
+		newSubTable.Class1Record = records[oldCount:]
+
+		oldSubTable.Class1Count = len(oldSubTable.Class1Record)
+		newSubTable.Class1Count = len(newSubTable.Class1Record)
+
+		ok = True
+
+	return ok
+
+
 splitTable = {	'GSUB': {
 #					1: splitSingleSubst,
 #					2: splitMultipleSubst,
@@ -693,7 +748,7 @@ splitTable = {	'GSUB': {
 					},
 				'GPOS': {
 #					1: splitSinglePos,
-#					2: splitPairPos,
+					2: splitPairPos,
 #					3: splitCursivePos,
 #					4: splitMarkBasePos,
 #					5: splitMarkLigPos,
@@ -768,12 +823,14 @@ def _buildClasses():
 		if name not in namespace:
 			# the class doesn't exist yet, so the base implementation is used.
 			cls = type(name, (baseClass,), {})
+			if name in ('GSUB', 'GPOS'):
+				cls.DontShare = True
 			namespace[name] = cls
 
 	for base, alts in _equivalents.items():
 		base = namespace[base]
 		for alt in alts:
-			namespace[alt] = type(alt, (base,), {})
+			namespace[alt] = base
 
 	global lookupTypes
 	lookupTypes = {

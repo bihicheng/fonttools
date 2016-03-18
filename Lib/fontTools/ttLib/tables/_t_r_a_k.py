@@ -1,4 +1,4 @@
-from __future__ import print_function, division, absolute_import, unicode_literals
+from __future__ import print_function, division, absolute_import
 from fontTools.misc.py23 import *
 from fontTools.misc import sstruct
 from fontTools.misc.fixedTools import fixedToFloat as fi2fl, floatToFixed as fl2fi
@@ -305,11 +305,10 @@ class TrackTableEntry(MutableMapping):
 		return "TrackTableEntry({}, nameIndex={})".format(self._map, self.nameIndex)
 
 	def __eq__(self, other):
-		if (isinstance(other, TrackTableEntry)
-				and self.nameIndex == other.nameIndex
-				and dict(self) == dict(other)):
-			return True
-		return False
+		if not isinstance(other, self.__class__):
+			return NotImplemented
+		return self.nameIndex == other.nameIndex and dict(self) == dict(other)
 
 	def __ne__(self, other):
-		return not self.__eq__(other)
+		result = self.__eq__(other)
+		return result if result is NotImplemented else not result
