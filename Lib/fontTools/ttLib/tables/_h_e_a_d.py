@@ -39,7 +39,7 @@ class table__h_e_a_d(DefaultTable.DefaultTable):
 		dummy, rest = sstruct.unpack2(headFormat, data, self)
 		if rest:
 			# this is quite illegal, but there seem to be fonts out there that do this
-			warnings.warn("extra bytes at the end of 'head' table")
+			log.warning("extra bytes at the end of 'head' table")
 			#assert rest == "\0\0"
 
 		# For timestamp fields, ignore the top four bytes.  Some fonts have
