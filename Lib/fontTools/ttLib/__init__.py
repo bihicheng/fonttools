@@ -65,7 +65,7 @@ class TTFont(object):
 	def __init__(self, file=None, res_name_or_index=None,
 			sfntVersion="\000\001\000\000", flavor=None, checkChecksums=False,
 			verbose=None, recalcBBoxes=True, allowVID=False, ignoreDecompileErrors=False,
-			recalcTimestamp=True, fontNumber=-1, lazy=None, quiet=None):
+			recalcTimestamp=True, fontNumber=0, lazy=None, quiet=None):
 
 		"""The constructor can be called with a few different arguments.
 		When reading a font from disk, 'file' should be either a pathname
