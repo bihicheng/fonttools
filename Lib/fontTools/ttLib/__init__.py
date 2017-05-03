@@ -62,7 +62,7 @@ class TTFont(object):
 	accessed. This means that simple operations can be extremely fast.
 	"""
 
-	def __init__(self, file=None, res_name_or_index=None,
+	def __init__(self, file=None, res_name_or_index=0,
 			sfntVersion="\000\001\000\000", flavor=None, checkChecksums=False,
 			verbose=None, recalcBBoxes=True, allowVID=False, ignoreDecompileErrors=False,
 			recalcTimestamp=True, fontNumber=0, lazy=None, quiet=None):
